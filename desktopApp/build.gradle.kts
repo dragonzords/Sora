@@ -1,0 +1,744 @@
+import java.net.URI
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipFile
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+/** What the packages, the launcher and the settings footer all say. */
+val appVersion: String = providers.gradleProperty("sora.version").orNull
+    ?.removePrefix("v")
+    ?.takeIf { it.isNotBlank() }
+    // The same version the Android build ships, from the root build — a hard-coded fallback here
+    // went stale and made every local or unversioned build announce itself as 1.8-beta1, which
+    // the update checker then offered to "update" to an older release.
+    ?: rootProject.extra["soraVersionName"] as String
+
+/** Which platform this build is *for*, which is the host unless told otherwise. */
+val hostIsWindows = System.getProperty("os.name").contains("Windows", ignoreCase = true)
+val hostIsLinux = System.getProperty("os.name").contains("Linux", ignoreCase = true)
+val hostIsMac = System.getProperty("os.name").contains("Mac", ignoreCase = true)
+val targetOs: String = (providers.gradleProperty("sora.target").orNull ?: when {
+    hostIsWindows -> "windows"
+    hostIsLinux -> "linux"
+    hostIsMac -> "macos"
+    else -> error("Sora desktop supports Linux, Windows, and macOS only")
+}).lowercase()
+
+val hostArch = System.getProperty("os.arch").lowercase()
+val isArm64 = hostArch == "aarch64" || hostArch == "arm64"
+
+// The installers stamp the app's own version: 1.9.5 stays 1.9.5. Windows metadata needs exactly
+// MAJOR.MINOR.BUILD, so a two-part version is padded (1.8 → 1.8.0) and a "-beta1" suffix is left
+// out of the numeric version.
+val nativePackageVersion = appVersion.substringBefore('-').split('.')
+    .let { (it + listOf("0", "0")).take(3) }
+    .joinToString(".")
+
+// FFmpeg decodes audio; see DesktopAudioDecoder.
+val javacppVersion = "1.5.12"
+val ffmpegVersion = "7.1.1-$javacppVersion"
+val nativeClassifier = when (targetOs) {
+    "windows" -> "windows-x86_64"
+    "linux" -> "linux-x86_64"
+    "macos" -> if (isArm64) "macosx-arm64" else "macosx-x86_64"
+    else -> error("Sora desktop supports Linux, Windows, and macOS only")
+}
+private fun localProperty(name: String): String = rootProject.file("local.properties")
+    .takeIf { it.isFile }
+    ?.readLines()
+    ?.firstOrNull { it.startsWith("$name=") }
+    ?.substringAfter('=')
+    ?.trim()
+    ?.takeIf { it.isNotBlank() }
+    ?: System.getenv(name).orEmpty().trim()
+
+val desktopModuleIndexUrl = localProperty("MODULE_INDEX_URL")
+
+// Last.fm signs every request with these, so signing in from inside the app
+// needs them at hand. Supplied locally and never committed, as on Android.
+val listenTogetherServer = localProperty("LISTEN_TOGETHER_SERVER")
+val signatureApiUrl = localProperty("SIGNATURE_API_URL")
+val lastfmApiKey = localProperty("LASTFM_API_KEY")
+val lastfmSecret = localProperty("LASTFM_SECRET")
+
+plugins {
+    id("org.jetbrains.kotlin.jvm")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.compose")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+dependencies {
+    // Already on the classpath through the NewPipe extractor.
+    implementation("org.jsoup:jsoup:1.22.2")
+    implementation("com.google.zxing:core:3.5.3")
+
+    implementation(project(":shared"))
+    // Its own copy of the player and pages; the phone and TV keep :sharedUi.
+    implementation(project(":desktopUi"))
+    // BotGuard, for the PoTokens YouTube's web clients need: the phone runs it in an Android
+    // WebView, the desktop in JavaFX's (WebKit). Per-platform jars carry the natives.
+    val javafxClassifier = when (targetOs) {
+        "windows" -> "win"
+        "macos" -> if (isArm64) "mac-aarch64" else "mac"
+        else -> "linux"
+    }
+    listOf("base", "graphics", "controls", "media", "web").forEach { module ->
+        implementation("org.openjfx:javafx-$module:21.0.10:$javafxClassifier")
+    }
+
+    // The shared player loads artwork through Coil, as the phone does.
+    implementation("io.coil-kt.coil3:coil-network-okhttp:3.0.4")
+
+    // Automix runs the same two models the Android build does. ONNX Runtime stopped shipping
+    // osx-x64 natives after 1.23, so an Intel Mac build takes the last release that has them —
+    // without it the beat model cannot load there and Automix has no meter.
+    // ponytail: Intel Macs stay on 1.23.2 for good; drop the Intel build when that ages out.
+    val onnxRuntimeVersion = if (targetOs == "macos" && !isArm64) "1.23.2" else "1.29.0"
+    implementation("com.microsoft.onnxruntime:onnxruntime:$onnxRuntimeVersion")
+
+    // Decoding, resampling and demuxing for the audio engine.
+    implementation("org.bytedeco:javacpp:$javacppVersion")
+    implementation("org.bytedeco:javacpp:$javacppVersion:$nativeClassifier")
+    implementation("org.bytedeco:ffmpeg:$ffmpegVersion")
+    implementation("org.bytedeco:ffmpeg:$ffmpegVersion:$nativeClassifier")
+
+    // The same backdrop blur the Android build uses for its floating bars.
+    // On Windows, 1.7.2 keeps this Compose Desktop 1.10.3 app on the matching UI/text/animation
+    // runtime. Preserve Linux's existing dependency graph exactly as it was.
+    val desktopHazeVersion = if (targetOs == "windows") "1.7.2" else "1.7.3"
+    implementation("dev.chrisbanes.haze:haze:$desktopHazeVersion")
+    implementation("dev.chrisbanes.haze:haze-materials:$desktopHazeVersion")
+
+    // The Compose plugin's own `compose.*` accessors are deprecated, so these are the coordinates
+    // they stood for. Keep [composeVersion] in step with the plugin version in the root build file;
+    // Material 3 and the icons ship on their own numbers.
+    val composeVersion = "1.10.3"
+    implementation("org.jetbrains.compose.runtime:runtime:$composeVersion")
+    implementation("org.jetbrains.compose.foundation:foundation:$composeVersion")
+    implementation("org.jetbrains.compose.material3:material3:1.9.0")
+    implementation("org.jetbrains.compose.components:components-resources:$composeVersion")
+    // Pinned: this artifact no longer receives updates.
+    implementation("org.jetbrains.compose.material:material-icons-extended:1.7.3")
+    // The Skiko runtime rides in on this, and Skiko is per-platform.
+    implementation(
+        when (targetOs) {
+            "windows" -> "org.jetbrains.compose.desktop:desktop-jvm-windows-x64:$composeVersion"
+            "macos" -> "org.jetbrains.compose.desktop:desktop-jvm-macos-${if (isArm64) "arm64" else "x64"}:$composeVersion"
+            else -> "org.jetbrains.compose.desktop:desktop-jvm-linux-x64:$composeVersion"
+        }
+    )
+
+    implementation("io.ktor:ktor-client-core:3.0.3")
+    implementation("io.ktor:ktor-client-cio:3.0.3")
+    implementation("io.ktor:ktor-client-content-negotiation:3.0.3")
+    // Listen Together speaks over a WebSocket; the Discord gateway already uses the same engine.
+    implementation("io.ktor:ktor-client-websockets:3.0.3")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
+    implementation("org.slf4j:slf4j-nop:2.0.16")
+
+    // Browsers keep their cookies in SQLite, and importing a session from one is how this app signs
+    // in — see DesktopBrowserCookies.
+    implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+    // Chromium protects its Windows master key with DPAPI. JNA's platform helpers let the app
+    // unwrap that key in the same Windows user session without invoking a shell or exposing it.
+    implementation("net.java.dev.jna:jna-platform:5.19.1")
+
+    // Linux desktop media controls use the standard session-bus MPRIS interfaces.
+    implementation("com.github.hypfvieh:dbus-java-core:5.2.0")
+    implementation("com.github.hypfvieh:dbus-java-transport-junixsocket:5.2.0")
+
+    // Same URL deobfuscation helper used by Android's StreamResolver.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+
+    // JVM equivalent of Android's QuickJS module host.
+    implementation("org.graalvm.polyglot:polyglot:24.1.2")
+    implementation("org.graalvm.polyglot:js:24.1.2")
+    implementation("org.graalvm.js:js-language:24.1.2")
+
+    testImplementation(kotlin("test"))
+}
+
+tasks.withType<Test> {
+    systemProperty("java.awt.headless", "true")
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_21)
+    }
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+/** Builds the Automix analyser from the same C++ the Android app compiles. */
+// Per target, because both write the library under the same name and a Windows cross-build
+// otherwise left a `.dll` where the next Linux run looked for its `.so`.
+val analysisNativeDir = layout.buildDirectory.dir("native/$targetOs")
+
+/** The tiny Windows frame bridge is independent of the optional analyser and SMTC libraries. */
+val windowNativeDir = layout.buildDirectory.dir("native-window/$targetOs")
+
+/**
+ * Whether this build is producing the analyser for a platform that is not the one running the
+ * build.
+ */
+val crossBuildingForWindows = targetOs == "windows" && !hostIsWindows
+
+/**
+ * An executable's absolute path, from the PATH this build was invoked with.
+ *
+ * Resolved here rather than left to the child process. Gradle runs external
+ * commands from the daemon, whose own PATH is whatever it was started with, so
+ * a daemon reused from a shell that had no cmake cannot find the one the
+ * current shell does — it fails with a bare "No such file or directory" while
+ * `cmake --version` works fine in the terminal beside it.
+ */
+/**
+ * Whether a tool on the PATH can actually be started.
+ *
+ * A PATH entry can be a wrapper script whose own interpreter is gone; it is a file, it is
+ * executable, and it fails only at exec time — which surfaces as a build failure rather than as the
+ * missing-tool path this build already handles.
+ */
+fun runs(tool: File): Boolean = runCatching {
+    val process = ProcessBuilder(tool.absolutePath, "--version")
+        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+        .redirectError(ProcessBuilder.Redirect.DISCARD)
+        .start()
+    if (!process.waitFor(10, TimeUnit.SECONDS)) {
+        process.destroyForcibly()
+        false
+    } else {
+        process.exitValue() == 0
+    }
+}.getOrDefault(false)
+
+fun findOnPath(tool: String): File? {
+    // Windows keeps the extension on the file and off the command line, so a bare name matches
+    // nothing on disk: PATHEXT is the list a shell would have tried.
+    val names = if (!hostIsWindows) {
+        listOf(tool)
+    } else {
+        val extensions = System.getenv("PATHEXT").orEmpty()
+            .ifBlank { ".COM;.EXE;.BAT;.CMD" }
+            .split(';')
+            .filter(String::isNotBlank)
+        listOf(tool) + extensions.map { tool + it.lowercase() }
+    }
+    return System.getenv("PATH").orEmpty()
+        .split(File.pathSeparator)
+        .filter(String::isNotBlank)
+        .flatMap { directory -> names.map { File(directory, it) } }
+        // A PATHEXT match is executable by definition, and Windows' own canExecute is unreliable.
+        .firstOrNull { it.isFile && (hostIsWindows || it.canExecute()) && runs(it) }
+}
+
+fun cmakeBinary(): String = findOnPath("cmake")?.absolutePath ?: "cmake"
+
+val buildAnalysisNative by tasks.registering {
+    val cmakeSource = project.file("native")
+    val outputDir = analysisNativeDir.get().asFile
+    val crossing = crossBuildingForWindows
+    val toolchain = project.file("native/mingw-w64.cmake")
+    inputs.dir(rootProject.file("native/analyzer"))
+    inputs.dir(rootProject.file("app/src/main/cpp/jni"))
+    inputs.dir(project.file("native"))
+    inputs.property("target", targetOs)
+    outputs.dir(outputDir)
+    onlyIf {
+        val cmake = findOnPath("cmake")
+        if (cmake == null) {
+            logger.lifecycle(
+                "no usable cmake — building without the Automix analyser. If cmake is installed, " +
+                    "a Gradle daemon started before it was on PATH may be in use: ./gradlew --stop",
+            )
+        }
+        val compilerName = if (crossing) "x86_64-w64-mingw32-g++" else "g++"
+        val compiler = targetOs != "windows" || findOnPath(compilerName) != null
+        val ninja = targetOs != "windows" || findOnPath("ninja") != null
+        if (cmake != null && (!compiler || !ninja)) {
+            logger.lifecycle(
+                "$compilerName or Ninja not found — the Windows build will have no Automix analyser. " +
+                    "Install a MinGW C++ compiler and Ninja, then rebuild.",
+            )
+        }
+        cmake != null && compiler && ninja
+    }
+    doLast {
+        val javaHome = System.getProperty("java.home")
+        val compiler = if (targetOs == "windows") {
+            findOnPath(if (crossing) "x86_64-w64-mingw32-g++" else "g++")
+                ?: error("the Windows C++ compiler disappeared while building the analyser")
+        } else {
+            null
+        }
+        val ninja = if (targetOs == "windows") {
+            findOnPath("ninja") ?: error("Ninja disappeared while building the analyser")
+        } else {
+            null
+        }
+        providers.exec {
+            commandLine(
+                buildList {
+                    addAll(listOf(cmakeBinary(), "-S", cmakeSource.absolutePath, "-B", outputDir.absolutePath))
+                    if (targetOs == "windows") {
+                        // The host may not have Visual Studio/nmake. Select the MinGW toolchain we
+                        // checked above and discard any generator cached by an earlier configure.
+                        addAll(
+                            listOf(
+                                "--fresh",
+                                "-G", "Ninja",
+                                "-DCMAKE_MAKE_PROGRAM=${ninja!!.absolutePath}",
+                                "-DCMAKE_CXX_COMPILER=${compiler!!.absolutePath}",
+                            ),
+                        )
+                    }
+                    add("-DCMAKE_BUILD_TYPE=Release")
+                    if (crossing) add("-DCMAKE_TOOLCHAIN_FILE=${toolchain.absolutePath}")
+                },
+            )
+            environment("JAVA_HOME", javaHome)
+        }.result.get().assertNormalExitValue()
+        providers.exec {
+            commandLine(cmakeBinary(), "--build", outputDir.absolutePath, "--config", "Release", "-j", "4")
+            environment("JAVA_HOME", javaHome)
+        }.result.get().assertNormalExitValue()
+    }
+}
+
+/**
+ * Builds the Win32/DWM frame bridge even when the much larger analyser build is skipped during a
+ * desktop UI run. It is intentionally absent from Linux builds, whose window manager remains the
+ * sole owner of decoration and behaviour.
+ */
+val buildWindowNative by tasks.registering {
+    val cmakeSource = project.file("native/window")
+    val outputDir = windowNativeDir.get().asFile
+    val crossing = crossBuildingForWindows
+    val toolchain = project.file("native/mingw-w64.cmake")
+    inputs.dir(cmakeSource)
+    // Music recognition's notification (sora_notify.dll) builds in the same CMake project.
+    inputs.dir(project.file("native/notify"))
+    inputs.property("target", targetOs)
+    outputs.dir(outputDir)
+    onlyIf {
+        if (targetOs != "windows") return@onlyIf false
+        val cmake = findOnPath("cmake")
+        val compiler = findOnPath(if (crossing) "x86_64-w64-mingw32-g++" else "g++")
+        val ninja = findOnPath("ninja")
+        if (cmake == null || compiler == null || ninja == null) {
+            logger.lifecycle(
+                "cmake, Ninja, or a MinGW C++ compiler is unavailable — the Windows build will " +
+                    "fall back to Compose's frameless window behaviour.",
+            )
+        }
+        cmake != null && compiler != null && ninja != null
+    }
+    doLast {
+        val javaHome = System.getProperty("java.home")
+        val compiler = findOnPath(if (crossing) "x86_64-w64-mingw32-g++" else "g++")
+            ?: error("MinGW C++ compiler disappeared while building the Windows frame")
+        val ninja = findOnPath("ninja")
+            ?: error("Ninja disappeared while building the Windows frame")
+        providers.exec {
+            commandLine(
+                buildList {
+                    addAll(
+                        listOf(
+                            cmakeBinary(),
+                            "-S", cmakeSource.absolutePath,
+                            "-B", outputDir.absolutePath,
+                            "-G", "Ninja",
+                            "-DCMAKE_MAKE_PROGRAM=${ninja.absolutePath}",
+                            "-DCMAKE_CXX_COMPILER=${compiler.absolutePath}",
+                            "-DCMAKE_BUILD_TYPE=Release",
+                        ),
+                    )
+                    if (crossing) add("-DCMAKE_TOOLCHAIN_FILE=${toolchain.absolutePath}")
+                },
+            )
+            environment("JAVA_HOME", javaHome)
+        }.result.get().assertNormalExitValue()
+        providers.exec {
+            commandLine(cmakeBinary(), "--build", outputDir.absolutePath, "-j", "4")
+            environment("JAVA_HOME", javaHome)
+        }.result.get().assertNormalExitValue()
+    }
+}
+
+/**
+ * Voice search's native half on macOS: a small Swift library over Apple's Speech framework, the
+ * recognizer Siri and Dictation use. Windows' counterpart (native/speech/sora_speech_win.cpp) is
+ * C++/WinRT, its own CMake project built with Visual Studio's MSVC (the rest of native/ builds with
+ * MinGW, which has no C++/WinRT); without it the mic uses Win+H. Linux uses Vosk, below.
+ */
+val speechNativeDir = layout.buildDirectory.dir("native-speech/$targetOs")
+
+val buildSpeechNative by tasks.registering {
+    val outputDir = speechNativeDir.get().asFile
+    val swiftSource = project.file("native/speech/SoraSpeech.swift")
+    val speechSource = project.file("native/speech")
+    // Music recognition's result notification on macOS (UserNotifications), built alongside.
+    val notifySource = project.file("native/notify/SoraNotify.swift")
+    val onWindows = targetOs == "windows" && !crossBuildingForWindows
+    inputs.dir(speechSource)
+    inputs.file(notifySource)
+    inputs.property("target", targetOs)
+    outputs.dir(outputDir)
+    onlyIf {
+        when (targetOs) {
+            "macos" -> (findOnPath("swiftc") != null).also {
+                if (!it) logger.lifecycle("swiftc not found — the macOS build will have no voice search.")
+            }
+            "windows" -> (onWindows && findOnPath("cmake") != null).also {
+                if (!it) logger.lifecycle("Not on Windows with cmake — the mic will use Win+H.")
+            }
+            else -> false
+        }
+    }
+    doLast {
+        outputDir.mkdirs()
+        if (targetOs == "windows") {
+            // CMake's default generator on Windows is the newest Visual Studio installed, which
+            // brings MSVC and C++/WinRT without a developer prompt. None installed: Win+H.
+            val configure = providers.exec {
+                commandLine(cmakeBinary(), "-S", speechSource.absolutePath, "-B", outputDir.absolutePath, "-A", "x64")
+                isIgnoreExitValue = true
+            }
+            val built = configure.result.get().exitValue == 0 && providers.exec {
+                commandLine(cmakeBinary(), "--build", outputDir.absolutePath, "--config", "Release")
+                isIgnoreExitValue = true
+            }.result.get().exitValue == 0
+            if (!built) {
+                logger.warn(
+                    "Windows voice search did not build (needs Visual Studio with C++):\n" +
+                        configure.standardOutput.asText.get().takeLast(4000),
+                )
+            }
+            return@doLast
+        }
+        providers.exec {
+            commandLine(
+                findOnPath("swiftc")!!.absolutePath, "-emit-library", "-O",
+                "-target", if (isArm64) "arm64-apple-macos11" else "x86_64-apple-macos11",
+                "-o", File(outputDir, "libsora_speech.dylib").absolutePath,
+                swiftSource.absolutePath,
+            )
+        }.result.get().assertNormalExitValue()
+        providers.exec {
+            commandLine(
+                findOnPath("swiftc")!!.absolutePath, "-emit-library", "-O",
+                "-target", if (isArm64) "arm64-apple-macos11" else "x86_64-apple-macos11",
+                "-o", File(outputDir, "libsora_notify.dylib").absolutePath,
+                notifySource.absolutePath,
+            )
+        }.result.get().assertNormalExitValue()
+    }
+}
+
+/**
+ * Linux voice search, which has no system recognizer: Vosk, streaming words as they're heard.
+ * Only the Linux libvosk.so is taken from Vosk's jar (which carries every OS's), plus its small
+ * Indian-English model; other languages download in the app when the user picks them. Fetched at build time, checked against the
+ * hashes Vosk publishes, and shipped in the package so it works offline from the first launch.
+ */
+val voskNative: Configuration by configurations.creating { isTransitive = false }
+dependencies { voskNative("com.alphacephei:vosk:0.3.45") }
+
+val voskDir = layout.buildDirectory.dir("vosk")
+// Only English ships; other languages' models download in the app when picked (DesktopVoiceSearch.kt).
+val voskModels = mapOf(
+    "vosk-model-small-en-in-0.4" to "62fd085f33c8c5fc01a235030e2a1fe3",
+)
+
+val prepareVosk by tasks.registering {
+    val outputDir = voskDir.get().asFile
+    val jar = voskNative
+    inputs.files(jar)
+    outputs.dir(outputDir)
+    onlyIf { targetOs == "linux" }
+    doLast {
+        fun md5(file: File) = MessageDigest.getInstance("MD5")
+            .digest(file.readBytes()).joinToString("") { "%02x".format(it) }
+        val native = File(outputDir, "native").apply { mkdirs() }
+        ZipFile(jar.singleFile).use { zip ->
+            zip.getInputStream(zip.getEntry("linux-x86-64/libvosk.so")).use { input ->
+                File(native, "libvosk.so").outputStream().use(input::copyTo)
+            }
+        }
+        val models = File(outputDir, "models").apply { mkdirs() }
+        voskModels.forEach { (name, hash) ->
+            val target = File(models, "$name.zip")
+            if (target.isFile && md5(target) == hash) return@forEach
+            val partial = File(target.path + ".partial")
+            URI("https://alphacephei.com/vosk/models/$name.zip").toURL().openStream()
+                .use { input -> partial.outputStream().use(input::copyTo) }
+            check(md5(partial) == hash) { "$name failed its checksum" }
+            partial.renameTo(target)
+        }
+    }
+}
+
+tasks.named<ProcessResources>("processResources") {
+    dependsOn(buildAnalysisNative, buildWindowNative, buildSpeechNative, prepareVosk)
+    from(speechNativeDir) {
+        include("*.dylib", "sora_speech.dll")
+        into("native")
+    }
+    // Linux only: a Mac or Windows build must not pick up a Linux run's leftovers in build/.
+    if (targetOs == "linux") {
+        from(voskDir.map { it.dir("native") }) { into("native") }
+        from(voskDir.map { it.dir("models") }) { into("models") }
+    }
+    from(analysisNativeDir) {
+        include("*.so", "*.dll", "*.dylib")
+        into("native")
+    }
+    from(windowNativeDir) {
+        include("*.dll")
+        into("native")
+    }
+    // The Automix models, taken from the Android module rather than copied into this one.
+    from(rootProject.file("app/src/main/assets")) {
+        include("*.onnx")
+        into("models")
+    }
+}
+
+// Kotlin 2.4 no longer contributes this JVM target's compiler output to Gradle's plain `jar`
+// task in this project. Compose's dev runner and the portable launcher both use that jar, so add
+// the output explicitly instead of producing a resources-only application archive.
+tasks.named<Jar>("jar") {
+    val kotlinClasses = tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileKotlin")
+    dependsOn(kotlinClasses)
+    from(kotlinClasses.flatMap { it.destinationDirectory })
+}
+
+/** A Windows build that can be assembled here, since an installer cannot be. */
+val windowsPortableDir = layout.buildDirectory.dir("windows-portable")
+
+val windowsPortableAssemble by tasks.registering {
+    group = "distribution"
+    description = "Lays out a Windows-runnable folder: application jars, Windows natives, launcher."
+    dependsOn(tasks.named("jar"))
+    val stage = windowsPortableDir.map { it.dir("Sora") }
+    val appJar = tasks.named<Jar>("jar").flatMap { it.archiveFile }
+    val runtime = configurations.named("runtimeClasspath")
+    val version = appVersion
+    val moduleIndex = desktopModuleIndexUrl
+    val lastfmKey = lastfmApiKey
+    val lastfmSharedSecret = lastfmSecret
+    val partyServer = listenTogetherServer
+    val signatureUrl = signatureApiUrl
+    val mainClass = composeMainClass
+    // Declared, not implied.
+    inputs.file(appJar)
+    inputs.files(runtime)
+    inputs.property("version", version)
+    inputs.property("moduleIndex", moduleIndex)
+    inputs.property("lastfm", lastfmKey.isNotBlank())
+    inputs.property("partyServer", partyServer)
+    inputs.property("signatureUrl", signatureUrl)
+    inputs.property("mainClass", mainClass)
+    outputs.dir(stage)
+    doLast {
+        val target = stage.get().asFile
+        val lib = File(target, "lib")
+        lib.deleteRecursively()
+        lib.mkdirs()
+
+        // Named by coordinate rather than by file name.
+        runtime.get().incoming.artifacts.artifacts.forEach { artifact ->
+            val id = artifact.id.componentIdentifier
+            val group = (id as? org.gradle.api.artifacts.component.ModuleComponentIdentifier)?.group
+            val name = if (group.isNullOrBlank()) artifact.file.name else "$group.${artifact.file.name}"
+            artifact.file.copyTo(File(lib, name), overwrite = true)
+        }
+        appJar.get().asFile.copyTo(File(lib, "sora-app.jar"), overwrite = true)
+
+        // `lib\*` rather than a spelled-out classpath: the wildcard is what keeps this working when
+        // a dependency is added, and the JVM is what expands it.
+        File(target, "Sora.bat").writeText(
+            buildString {
+                appendLine("@echo off")
+                appendLine("setlocal")
+                appendLine("rem Sora, portable. Needs a Java 21+ runtime on PATH or in JAVA_HOME.")
+                appendLine("set \"HERE=%~dp0\"")
+                appendLine("set \"RUNNER=java\"")
+                appendLine("if defined JAVA_HOME set \"RUNNER=%JAVA_HOME%\\bin\\java\"")
+                append("\"%RUNNER%\" -Dsora.version=$version")
+                if (moduleIndex.isNotBlank()) append(" -Dsora.module.index=$moduleIndex")
+                if (lastfmKey.isNotBlank() && lastfmSharedSecret.isNotBlank()) {
+                    append(" -Dsora.lastfm.key=$lastfmKey -Dsora.lastfm.secret=$lastfmSharedSecret")
+                }
+                if (partyServer.isNotBlank()) append(" -Dsora.listentogether.server=$partyServer")
+                if (signatureUrl.isNotBlank()) append(" -Dsora.signature.url=$signatureUrl")
+                appendLine(" -cp \"%HERE%lib\\*\" $mainClass %*")
+                appendLine("endlocal")
+            },
+        )
+
+        // What "it builds" is not the same as "it runs", and the difference is exactly what shipped
+        // a broken archive.
+        val jars = lib.listFiles { file: File -> file.name.endsWith(".jar") }.orEmpty()
+        fun holds(entry: String) = jars.any { jar ->
+            ZipFile(jar).use { zip -> zip.getEntry(entry) != null }
+        }
+        val problems = buildList {
+            if (!holds("com/zords/soramusic/desktop/MainKt.class")) {
+                add("the Sora desktop entry point is missing")
+            }
+            if (!holds("androidx/compose/runtime/Composer.class")) {
+                add("the Compose runtime is missing")
+            }
+            if (jars.none { it.name.contains("skiko-awt-runtime-windows") }) {
+                add("the Windows Skiko renderer is missing")
+            }
+            if (jars.any { it.name.contains("skiko-awt-runtime-linux") }) {
+                add("a Linux Skiko renderer is in a Windows archive")
+            }
+            if (!holds("org/bytedeco/ffmpeg/windows-x86_64/avformat.dll") &&
+                jars.none { it.name.contains("ffmpeg") && it.name.contains("windows-x86_64") }
+            ) {
+                add("the Windows FFmpeg natives are missing")
+            }
+        }
+        check(problems.isEmpty()) { "windowsPortable: " + problems.joinToString("; ") }
+
+        val analyser = File(analysisNativeDir.get().asFile, "sora_analysis.dll").isFile
+        logger.lifecycle(
+            if (analyser) {
+                "windowsPortable: verified — Compose runtime, Windows renderer, Windows FFmpeg, Automix analyser."
+            } else {
+                "windowsPortable: verified, but no sora_analysis.dll — Automix will not run in this archive. " +
+                    "Rebuild with: nix-shell -p cmake pkgsCross.mingwW64.buildPackages.gcc"
+            },
+        )
+    }
+}
+
+val windowsPortable by tasks.registering(Zip::class) {
+    group = "distribution"
+    description = "Zips the portable Windows folder for copying to a Windows machine."
+    dependsOn(windowsPortableAssemble)
+    from(windowsPortableDir)
+    archiveFileName.set("Sora-$appVersion-windows-portable.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("distributions"))
+    doLast { logger.lifecycle("windowsPortable: ${archiveFile.get().asFile.absolutePath}") }
+}
+
+val composeMainClass = "com.zords.soramusic.desktop.MainKt"
+
+compose.desktop {
+    application {
+        javaHome = javaToolchains.launcherFor(java.toolchain).map {
+            it.metadata.installationPath.asFile.absolutePath
+        }.get()
+        mainClass = composeMainClass
+        jvmArgs("-Xmx512m")
+        jvmArgs("-XX:+UseG1GC", "-XX:G1PeriodicGCInterval=20000", "-XX:G1PeriodicGCSystemLoadThreshold=0")
+        jvmArgs("-Dsora.version=$appVersion")
+        if (desktopModuleIndexUrl.isNotBlank()) {
+            jvmArgs("-Dsora.module.index=$desktopModuleIndexUrl")
+        }
+        if (lastfmApiKey.isNotBlank() && lastfmSecret.isNotBlank()) {
+            jvmArgs("-Dsora.lastfm.key=$lastfmApiKey", "-Dsora.lastfm.secret=$lastfmSecret")
+        }
+        if (listenTogetherServer.isNotBlank()) {
+            jvmArgs("-Dsora.listentogether.server=$listenTogetherServer")
+        }
+        if (signatureApiUrl.isNotBlank()) {
+            jvmArgs("-Dsora.signature.url=$signatureApiUrl")
+        }
+
+        buildTypes.release.proguard {
+            isEnabled.set(false)
+            obfuscate.set(false)
+            optimize.set(false)
+            configurationFiles.from(project.file("packaging/proguard-rules.pro"))
+        }
+
+        nativeDistributions {
+            targetFormats(
+                TargetFormat.Dmg,
+                TargetFormat.Pkg,
+                TargetFormat.Exe,
+                TargetFormat.Msi,
+                TargetFormat.Deb,
+                TargetFormat.Rpm,
+            )
+            packageName = "Sora"
+            packageVersion = nativePackageVersion
+            description = if (targetOs == "windows") "Sora" else "Aesthetic YouTube Music client"
+            vendor = "Sora contributors"
+            copyright = "Copyright © 2026 BitChord and Sora contributors"
+
+            modules(
+                "java.base",
+                "java.desktop",
+                "java.instrument",
+                "java.logging",
+                "java.management",
+                "java.naming",
+                "java.net.http",
+                "java.prefs",
+                "java.scripting",
+                "java.sql",
+                "java.xml",
+                "jdk.crypto.ec",
+                "jdk.dynalink",
+                // JavaFX WebEngine returns JavaScript objects through netscape.javascript.JSObject.
+                // Without this module the slim production runtime crashes in twkExecuteScript,
+                // while development runs work because the full JDK already contains it.
+                "jdk.jsobject",
+                "jdk.localedata",
+                "jdk.security.auth",
+                "jdk.unsupported",
+                "jdk.zipfs",
+            )
+
+            macOS {
+                iconFile.set(project.file("packaging/icons/AppIcon.icns"))
+                bundleID = "com.zords.soramusic"
+                appCategory = "public.app-category.music"
+                dockName = "Sora"
+                infoPlist {
+                    extraKeysRawXml = """
+                        <key>NSRequiresAquaSystemAppearance</key>
+                        <false/>
+                        <key>NSMicrophoneUsageDescription</key>
+                        <string>Sora listens through the microphone when you search by voice or recognize a song.</string>
+                        <key>NSSpeechRecognitionUsageDescription</key>
+                        <string>Sora turns what you say into a search for songs, artists, albums and playlists.</string>
+                    """.trimIndent()
+                }
+            }
+
+            linux {
+                iconFile.set(project.file("packaging/icons/AppIcon.png"))
+                menuGroup = "Audio"
+                appCategory = "AudioVideo;Audio;Player"
+                debMaintainer = "xyzuan1608@gmail.com"
+                rpmLicenseType = "GPL-3.0"
+            }
+
+            windows {
+                iconFile.set(project.file("packaging/icons/AppIcon.ico"))
+                upgradeUuid = "8cf8f381-55fe-4d99-9116-863b769e2de5"
+                menuGroup = "Sora"
+                shortcut = true
+                dirChooser = false
+                perUserInstall = true
+            }
+        }
+    }
+
+}

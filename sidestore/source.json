@@ -1,0 +1,89 @@
+{
+  "name": "Sora",
+  "identifier": "com.zords.soramusic.source",
+  "subtitle": "Sora for iOS, straight from GitHub releases.",
+  "description": "Official SideStore / AltStore source for Sora. New versions appear here as soon as a GitHub release is published.",
+  "iconURL": "https://raw.githubusercontent.com/dragonzords/Sora/main/iosApp/iosApp/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+  "website": "https://github.com/dragonzords/Sora",
+  "sourceURL": "https://raw.githubusercontent.com/dragonzords/Sora/main/sidestore/source.json",
+  "tintColor": "#000000",
+  "apps": [
+    {
+      "name": "Sora",
+      "bundleIdentifier": "com.zords.soramusic",
+      "developerName": "dragonzords",
+      "subtitle": "Music player with lyrics, karaoke and Listen Together.",
+      "localizedDescription": "Sora is a music player with synced lyrics, on-device karaoke, Listen Together, Atmos-style reverb and home-screen widgets.",
+      "iconURL": "https://raw.githubusercontent.com/dragonzords/Sora/main/iosApp/iosApp/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+      "tintColor": "#000000",
+      "category": "entertainment",
+      "screenshots": [],
+      "versions": [
+        {
+          "version": "1.9.5",
+          "buildVersion": "36",
+          "date": "2026-11-17T15:13:42Z",
+          "localizedDescription": "- **Control Center control** to recognize from anywhere (iOS 18 and later).\n- **Live Activity** on the lock screen and in the Dynamic Island while Sora listens, with a Cancel button.\n- The result arrives as a notification, with **Try again** when it couldn't recognize the song.\n- **Long-press the Sora icon** for new **Search** and **Recognize music** shortcuts.\n- Your music stays on the speaker or your AirPods while Sora listens.",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.5/Sora-1.9.5-ios.ipa",
+          "size": 80749709,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "1.9.4",
+          "buildVersion": "35",
+          "date": "2026-11-14T18:18:44Z",
+          "localizedDescription": "- New setting in Settings → Playback, **off by default**.\n- When on, Sora's volume bar sets only Sora's own level. Your phone's media volume and volume buttons stay as they are. Sora's level can't go above the phone's media volume.\n- Normalization, ReplayGain, crossfade, the equalizer and Dolby playback all keep working.\n\n- Picture in picture keeps playing into the next music video instead of closing.",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.4/Sora-1.9.4-ios.ipa",
+          "size": 80510045,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "1.9.3",
+          "buildVersion": "34",
+          "date": "2026-11-12T13:25:22Z",
+          "localizedDescription": "- Voice search through Apple's speech recognition (what Siri uses). Sora asks for the microphone and speech recognition the first time.\n- On **Auto**, Hindi is written the way song titles are listed: \"तू मिल जाए\" goes in as \"tu mil jaye\". Choose हिन्दी from the long-press menu to keep it in Devanagari.\n- Bangla isn't offered, because Apple's speech recognition doesn't support it.",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.3/Sora-1.9.3-ios.ipa",
+          "size": 80438933,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "1.9.2",
+          "buildVersion": "33",
+          "date": "2026-11-05T03:20:27Z",
+          "localizedDescription": "- Music videos with the audio/video switch; VP9 up to 4K on iOS 26.2 and later.\n- Video plays in the mini player too (Settings), and keeps playing while the player expands, collapses or rotates.\n- Picture-in-picture, which also starts by itself when you leave the app with a video playing.\n- With video in the mini player on, the lyrics and queue header plays the video instead of showing the album art.\n- Long videos no longer run the app out of memory.\n- The player menu no longer climbs to the top of the screen and jumps.\n- Swiping a song to the queue adds it once, not several times.",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.2/Sora-1.9.2-ios.ipa",
+          "size": 86724710,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "1.9.1",
+          "buildVersion": "32",
+          "date": "2026-10-30T16:47:24Z",
+          "localizedDescription": "- **Landscape support.** Rotate your iPhone; pages, the tab bar and the mini player stay clear of the notch and Dynamic Island. No more white flash while rotating.\n- **Several Google accounts.** Add, switch between and remove accounts, including Brand profiles, from the Account page. Your existing sign-in carries over.\n- **App icon picker** in Settings: Default, Liquid Glass and Liquid Glass Dark (real glass on iOS 26).\n- **Artist header video**, as on Android, when animated canvas is on.\n- **Follow artists and save releases** from their pages; Library updates right away.\n- **Liked Music and long playlists** now load in full, not just the first 100 songs.\n- **Quality upgrades mid-song** swap in without stopping playback, and the player menu has Upgrade quality and Revert to original.\n- **Lock screen controls** (play, pause, seek, next, previous) now work with Listen Together, and the lock screen no longer stays on Pause after you stop.\n- **Listen Together** stays in sync after the phone has been locked, and track changes no longer jump to the previous song's position.\n- Song and player menus: no more bouncing while scrolling; album and artist links work for more songs, and the player closes before opening a page.\n- Spotify connects through the in-app sign-in page only.",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.1/Sora-1.9.1-ios.ipa",
+          "size": 86541580,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "1.9.0",
+          "buildVersion": "31",
+          "date": "2026-10-23T05:31:26Z",
+          "localizedDescription": "Bug Fixes",
+          "downloadURL": "https://github.com/dragonzords/Sora/releases/download/v1.9.0/Sora-1.9.0-ios.ipa",
+          "size": 75207510,
+          "minOSVersion": "16.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.security.application-groups"
+        ],
+        "privacy": {
+          "NSPhotoLibraryAddUsageDescription": "Sora saves your Replay and lyrics cards to your photo library when you tap Save.",
+          "NSLocalNetworkUsageDescription": "Sora finds Chromecasts and Google Cast speakers on your Wi-Fi so you can play music on them."
+        }
+      }
+    }
+  ],
+  "news": []
+}
